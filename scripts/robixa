@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+#
+# ROBIXA BOT – Terminal Management Panel
+# Usage: robixa   or   ROBIXA
+#
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+# Resolve install root (script lives in scripts/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${INSTALL_ROOT}/.env"
+DATA_DIR="${INSTALL_ROOT}/data"
+LOG_FILE="${DATA_DIR}/robixa.log"
+VENV_DIR="${INSTALL_ROOT}/venv"
+SERVICE_NAME="robixa-bot"
+BIN_LINK="/usr/local/bin/robixa"
+
+cd "$INSTALL_ROOT"
+
+print_header() {
+    clear
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔══════════════════════════════════════╗"
+    echo "  ║         ROBIXA BOT  v2.0.0           ║"
+    echo "  ║      Terminal Management Panel       ║"
+    echo "  ╚══════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+pause() {
+    echo ""
+    echo -ne "  ${YELLOW}Press Enter to continue...${NC}"
+    read -r
+}
+
+do_uninstall() {
+    echo -e "\n  ${RED}${BOLD}⚠  UNINSTALL ROBIXA BOT${NC}"
+    echo -e "  This will remove:"
+    echo -e "    • Virtual environment"
+    echo -e "    • Database & data folder"
+    echo -e "    • .env configuration"
+    echo -e "    • systemd service (if any)"
+    echo -e "    • CLI command (robixa)"
+    echo ""
+    echo -ne "  ${YELLOW}Are you sure? Type YES to confirm: ${NC}"
+    read -r conf
+    if [[ "$conf" != "YES" ]]; then
+        echo -e "  ${BLUE}Cancelled.${NC}"
+        return
+    fi
+
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        sudo systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    fi
+    if systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        sudo systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    fi
+    sudo rm -f "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+    sudo systemctl daemon-reload 2>/dev/null || true
+    sudo rm -f "$BIN_LINK" 2>/dev/null || true
+
+    rm -rf "$VENV_DIR" 2>/dev/null || true
+    rm -rf "$DATA_DIR" 2>/dev/null || true
+    rm -f "$ENV_FILE" 2>/dev/null || true
+
+    echo -e "\n  ${GREEN}✔ ROBIXA BOT has been completely removed from this server.${NC}"
+    echo -e "  (Source code folder itself was kept. Delete the folder manually if desired.)"
+    pause
+    exit 0
+}
+
+set_admin_id() {
+    echo -e "\n  ${BOLD}Set Main Admin Numeric ID${NC}"
+    if [[ -f "$ENV_FILE" ]]; then
+        current=$(grep -E '^ADMIN_IDS=' "$ENV_FILE" | cut -d= -f2- || echo "")
+        echo -e "  Current: ${CYAN}${current:-none}${NC}"
+    else
+        echo -e "  ${YELLOW}.env not found. Run installer first.${NC}"
+        pause
+        return
+    fi
+    echo -ne "  New Admin ID (numbers only): "
+    read -r new_id
+    if [[ ! "$new_id" =~ ^[0-9]+$ ]]; then
+        echo -e "  ${RED}Invalid ID${NC}"
+        pause
+        return
+    fi
+    if grep -q '^ADMIN_IDS=' "$ENV_FILE"; then
+        sed -i "s/^ADMIN_IDS=.*/ADMIN_IDS=${new_id}/" "$ENV_FILE"
+    else
+        echo "ADMIN_IDS=${new_id}" >> "$ENV_FILE"
+    fi
+    echo -e "  ${GREEN}✔ Admin ID updated to ${new_id}${NC}"
+    echo -e "  ${YELLOW}Restart the bot for changes to take effect.${NC}"
+    pause
+}
+
+show_logs() {
+    echo -e "\n  ${BOLD}Log Viewer${NC}"
+    echo -e "  1) Errors only"
+    echo -e "  2) All logs"
+    echo -e "  0) Back"
+    echo -ne "  Choice: "
+    read -r choice
+    mkdir -p "$DATA_DIR"
+    touch "$LOG_FILE" 2>/dev/null || true
+
+    case "$choice" in
+        1)
+            echo -e "\n  ${RED}── ERROR logs (last 100 lines) ──${NC}\n"
+            if [[ -f "$LOG_FILE" ]]; then
+                grep -iE 'error|exception|traceback|critical|failed' "$LOG_FILE" | tail -100 || echo "  (no error lines found)"
+            else
+                # Also try journal or stdout capture
+                echo "  Log file empty or missing. Showing recent python trace if any..."
+                journalctl -u "${SERVICE_NAME}" -n 50 --no-pager 2>/dev/null | grep -iE 'error|exception' || echo "  No errors found."
+            fi
+            ;;
+        2)
+            echo -e "\n  ${CYAN}── ALL logs (last 80 lines) ──${NC}\n"
+            if [[ -f "$LOG_FILE" ]]; then
+                tail -80 "$LOG_FILE"
+            else
+                journalctl -u "${SERVICE_NAME}" -n 80 --no-pager 2>/dev/null || echo "  No log file yet. Run the bot first."
+            fi
+            ;;
+        *) return ;;
+    esac
+    pause
+}
+
+start_bot() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo -e "  ${RED}.env missing. Run ./install.sh first.${NC}"
+        pause
+        return
+    fi
+    if [[ ! -d "$VENV_DIR" ]]; then
+        echo -e "  ${RED}venv missing. Run ./install.sh first.${NC}"
+        pause
+        return
+    fi
+    echo -e "  ${GREEN}Starting ROBIXA BOT...${NC}"
+    # shellcheck disable=SC1091
+    source "${VENV_DIR}/bin/activate"
+    mkdir -p "$DATA_DIR"
+    exec python main.py 2>&1 | tee -a "$LOG_FILE"
+}
+
+status_bot() {
+    echo -e "\n  ${BOLD}Status${NC}"
+    if [[ -f "$ENV_FILE" ]]; then
+        echo -e "  Config: ${GREEN}present${NC}"
+        grep -E '^(BOT_VERSION|ADMIN_IDS|BOT_NAME)=' "$ENV_FILE" 2>/dev/null | sed 's/^/    /' || true
+    else
+        echo -e "  Config: ${RED}missing${NC}"
+    fi
+    if [[ -d "$VENV_DIR" ]]; then
+        echo -e "  venv:   ${GREEN}present${NC}"
+    else
+        echo -e "  venv:   ${RED}missing${NC}"
+    fi
+    if [[ -f "${DATA_DIR}/robixa.db" ]]; then
+        echo -e "  DB:     ${GREEN}present${NC}"
+    else
+        echo -e "  DB:     ${YELLOW}not created yet${NC}"
+    fi
+    if pgrep -f "python.*main.py" >/dev/null 2>&1; then
+        echo -e "  Process:${GREEN} running${NC}"
+    else
+        echo -e "  Process:${YELLOW} not running${NC}"
+    fi
+    pause
+}
+
+main_menu() {
+    while true; do
+        print_header
+        echo -e "  ${BOLD}1)${NC} Uninstall ROBIXA BOT"
+        echo -e "  ${BOLD}2)${NC} Set main Admin numeric ID"
+        echo -e "  ${BOLD}3)${NC} Show logs (error / all)"
+        echo -e "  ${BOLD}4)${NC} Start bot (foreground)"
+        echo -e "  ${BOLD}5)${NC} Status"
+        echo -e "  ${BOLD}0)${NC} Exit"
+        echo ""
+        echo -ne "  ${CYAN}Select: ${NC}"
+        read -r opt
+        case "$opt" in
+            1) do_uninstall ;;
+            2) set_admin_id ;;
+            3) show_logs ;;
+            4) start_bot ;;
+            5) status_bot ;;
+            0) echo -e "  ${BLUE}Bye.${NC}"; exit 0 ;;
+            *) echo -e "  ${RED}Invalid option${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# Allow both robixa and ROBIXA (case handled by filesystem / wrapper)
+main_menu
