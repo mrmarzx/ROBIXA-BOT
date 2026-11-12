@@ -24,7 +24,7 @@ print_header() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════╗"
-    echo "  ║         ROBIXA BOT  v2.0.0           ║"
+    echo "  ║         ROBIXA BOT  v2.1.512           ║"
     echo "  ║      Terminal Management Panel       ║"
     echo "  ╚══════════════════════════════════════╝"
     echo -e "${NC}"
