@@ -93,8 +93,8 @@ def panel_type_keyboard() -> InlineKeyboardMarkup:
 
 def products_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="➕ افزودن محصول", callback_data="prod:add"))
-    b.row(InlineKeyboardButton(text="📋 لیست محصولات", callback_data="prod:list"))
+    b.row(InlineKeyboardButton(text="➕ افزودن محصول", callback_data="product:add"))
+    b.row(InlineKeyboardButton(text="📋 لیست محصولات", callback_data="product:list"))
     return b.as_markup()
 
 
