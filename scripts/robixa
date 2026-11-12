@@ -134,47 +134,53 @@ show_logs() {
 }
 
 start_bot() {
-    if [[ ! -f "$ENV_FILE" ]]; then
-        echo -e "  ${RED}.env missing. Run ./install.sh first.${NC}"
-        pause
-        return
+    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+    local py="${INSTALL_ROOT}/venv/bin/python"
+    local mainf="${INSTALL_ROOT}/main.py"
+    mkdir -p "${INSTALL_ROOT}/data"
+    if [[ ! -f "$service_file" ]]; then
+        sudo tee "$service_file" > /dev/null << UNIT
+[Unit]
+Description=ROBIXA BOT Telegram Reseller Shop
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_ROOT}
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${py} ${mainf}
+Restart=always
+RestartSec=5
+StandardOutput=append:${INSTALL_ROOT}/data/robixa.log
+StandardError=append:${INSTALL_ROOT}/data/robixa.log
+[Install]
+WantedBy=multi-user.target
+UNIT
+        sudo systemctl daemon-reload
+        sudo systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
     fi
-    if [[ ! -d "$VENV_DIR" ]]; then
-        echo -e "  ${RED}venv missing. Run ./install.sh first.${NC}"
-        pause
-        return
+    sudo systemctl restart "${SERVICE_NAME}" 2>/dev/null || sudo systemctl start "${SERVICE_NAME}"
+    sleep 1
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        echo -e "  ${GREEN}✔${NC} Bot is running (systemd: ${SERVICE_NAME})"
+        echo -e "  Logs: journalctl -u ${SERVICE_NAME} -f"
+    else
+        echo -e "  ${RED}✖${NC} Not active. Last logs:"
+        journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || tail -20 "${INSTALL_ROOT}/data/robixa.log" 2>/dev/null || true
     fi
-    echo -e "  ${GREEN}Starting ROBIXA BOT...${NC}"
-    # shellcheck disable=SC1091
-    source "${VENV_DIR}/bin/activate"
-    mkdir -p "$DATA_DIR"
-    exec python main.py 2>&1 | tee -a "$LOG_FILE"
 }
 
 status_bot() {
-    echo -e "\n  ${BOLD}Status${NC}"
-    if [[ -f "$ENV_FILE" ]]; then
-        echo -e "  Config: ${GREEN}present${NC}"
-        grep -E '^(BOT_VERSION|ADMIN_IDS|BOT_NAME)=' "$ENV_FILE" 2>/dev/null | sed 's/^/    /' || true
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
+        systemctl status "${SERVICE_NAME}" --no-pager -l || true
     else
-        echo -e "  Config: ${RED}missing${NC}"
+        if pgrep -f "python.*main.py" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}Running (process)${NC}"
+            pgrep -af "python.*main.py"
+        else
+            echo -e "  ${YELLOW}Not running${NC}"
+        fi
     fi
-    if [[ -d "$VENV_DIR" ]]; then
-        echo -e "  venv:   ${GREEN}present${NC}"
-    else
-        echo -e "  venv:   ${RED}missing${NC}"
-    fi
-    if [[ -f "${DATA_DIR}/robixa.db" ]]; then
-        echo -e "  DB:     ${GREEN}present${NC}"
-    else
-        echo -e "  DB:     ${YELLOW}not created yet${NC}"
-    fi
-    if pgrep -f "python.*main.py" >/dev/null 2>&1; then
-        echo -e "  Process:${GREEN} running${NC}"
-    else
-        echo -e "  Process:${YELLOW} not running${NC}"
-    fi
-    pause
 }
 
 main_menu() {
