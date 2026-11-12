@@ -213,9 +213,51 @@ EOF
     chmod 600 "$ENV_FILE" || true
 }
 
+
+install_systemd_service() {
+    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+    local py="${VENV_DIR}/bin/python"
+    local main="${INSTALL_ROOT}/main.py"
+    if [[ ! -x "$py" ]]; then
+        echo -e "  ${YELLOW}⚠${NC} venv python not found – skip systemd"
+        return 0
+    fi
+    sudo tee "$service_file" > /dev/null << UNIT
+[Unit]
+Description=ROBIXA BOT Telegram Reseller Shop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${INSTALL_ROOT}
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${py} ${main}
+Restart=always
+RestartSec=5
+StandardOutput=append:${INSTALL_ROOT}/data/robixa.log
+StandardError=append:${INSTALL_ROOT}/data/robixa.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
+    sudo systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    sudo systemctl restart "${SERVICE_NAME}.service" || sudo systemctl start "${SERVICE_NAME}.service" || true
+    sleep 1
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        echo -e "  ${GREEN}✔${NC} systemd service active (${SERVICE_NAME}) – bot stays running"
+    else
+        echo -e "  ${YELLOW}⚠${NC} service installed but not active – run: sudo systemctl start ${SERVICE_NAME}"
+        echo -e "      logs: journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    fi
+}
+
+
 main() {
     print_banner
-    TOTAL=9; STEP=0
+    TOTAL=10; STEP=0
 
     if [[ "$(detect_previous)" == "1" ]]; then
         echo -e "${YELLOW}${BOLD}⚠  Previous ROBIXA installation detected.${NC}"
@@ -269,6 +311,9 @@ main() {
     python3 -c "import aiogram, httpx, aiosqlite, sqlalchemy, pydantic"
     echo -e "  ${GREEN}✔${NC} Packages OK"
 
+    STEP=$((STEP+1)); progress_bar $STEP $TOTAL; echo -e "\n  ${BLUE}→${NC} systemd service"
+    install_systemd_service
+
     progress_bar $TOTAL $TOTAL
     echo ""
     echo ""
@@ -276,11 +321,12 @@ main() {
     echo -e "${GREEN}${BOLD}   ROBIXA BOT installed successfully!${NC}"
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  Start:"
-    echo -e "    ${BOLD}cd ${INSTALL_ROOT}${NC}"
-    echo -e "    ${BOLD}source venv/bin/activate && python main.py${NC}"
-    echo ""
-    echo -e "  Management: ${BOLD}robixa${NC}"
+    echo -e "  Bot runs as systemd service: ${BOLD}${SERVICE_NAME}${NC}"
+    echo -e "  Status:  ${BOLD}sudo systemctl status ${SERVICE_NAME}${NC}"
+    echo -e "  Restart: ${BOLD}sudo systemctl restart ${SERVICE_NAME}${NC}"
+    echo -e "  Stop:    ${BOLD}sudo systemctl stop ${SERVICE_NAME}${NC}"
+    echo -e "  Logs:    ${BOLD}journalctl -u ${SERVICE_NAME} -f${NC}"
+    echo -e "  Or:      ${BOLD}robixa${NC}  (menu)"
     echo -e "  Admin ID: ${BOLD}${ADMIN_ID}${NC}"
     echo ""
 }
