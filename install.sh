@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ROBIXA BOT Installer v2.0.0
+# ROBIXA BOT Installer v2.1.512
 # One-liner: bash <(curl -fsSL https://raw.githubusercontent.com/mrmarzx/ROBIXA-BOT/main/install.sh)
 #
 set -euo pipefail
@@ -58,7 +58,7 @@ print_banner() {
  |_| \_\\___/|____/___/_/\_\/_/   \_\
 EOF
     echo -e "${NC}"
-    echo -e "${BOLD}          ROBIXA BOT  •  v2.0.0${NC}"
+    echo -e "${BOLD}          ROBIXA BOT  •  v2.1.512${NC}"
     echo -e "${BLUE}     Multi-Panel Telegram Shop  •  Phase 1-2-3${NC}"
     echo ""
 }
@@ -204,7 +204,7 @@ write_env() {
 BOT_TOKEN=${BOT_TOKEN}
 ADMIN_IDS=${ADMIN_ID}
 DATABASE_URL=sqlite+aiosqlite:///./data/robixa.db
-BOT_VERSION=2.0.0
+BOT_VERSION=2.1.512
 BOT_NAME=ROBIXA BOT
 SUPPORT_USERNAME=@Support
 BACKUP_INTERVAL_HOURS=24
