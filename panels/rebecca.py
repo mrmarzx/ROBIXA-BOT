@@ -1,4 +1,4 @@
-"""Rebecca panel client – reseller (non-sudo admin) + services."""
+"""Rebecca panel – strict real auth + services + admin (reseller)."""
 from __future__ import annotations
 import logging
 import secrets
@@ -23,9 +23,9 @@ class RebeccaPanel:
         username: str | None = None,
         password: str | None = None,
         token: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 20.0,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or "").rstrip("/")
         self.username = username
         self.password = password
         self._token = token
@@ -33,22 +33,23 @@ class RebeccaPanel:
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self):
+        if not self.base_url or not self.base_url.startswith(("http://", "https://")):
+            raise RebeccaAPIError("آدرس پنل نامعتبر است (باید با http:// یا https:// شروع شود)")
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
-            timeout=self.timeout,
+            timeout=httpx.Timeout(self.timeout, connect=10.0),
             verify=False,
             follow_redirects=True,
         )
-        if not self._token and self.username and self.password:
-            await self.login()
         return self
 
     async def __aexit__(self, *args):
         if self._client:
             await self._client.aclose()
+            self._client = None
 
     def _headers(self) -> dict:
-        h = {"Content-Type": "application/json", "Accept": "application/json"}
+        h = {"Accept": "application/json", "Content-Type": "application/json"}
         if self._token:
             h["Authorization"] = f"Bearer {self._token}"
         return h
@@ -61,72 +62,114 @@ class RebeccaPanel:
             path = f"/api{path}"
         try:
             r = await self._client.request(method, path, headers=self._headers(), **kwargs)
+        except httpx.ConnectError as e:
+            raise RebeccaAPIError(f"اتصال برقرار نشد: {e}") from e
+        except httpx.TimeoutException as e:
+            raise RebeccaAPIError(f"Timeout – پنل پاسخ نداد: {e}") from e
         except httpx.RequestError as e:
-            raise RebeccaAPIError(f"Connection error: {e}") from e
+            raise RebeccaAPIError(f"خطای شبکه: {e}") from e
         if r.status_code >= 400:
             try:
                 detail = r.json()
             except Exception:
-                detail = r.text
+                detail = (r.text or "")[:300]
             raise RebeccaAPIError(f"HTTP {r.status_code}", status_code=r.status_code, detail=detail)
         if r.status_code == 204 or not r.content:
             return {}
         try:
             return r.json()
         except Exception:
-            return {"raw": r.text}
+            return {"raw": (r.text or "")[:200]}
 
     async def login(self) -> str:
+        if not self.username or not self.password:
+            raise RebeccaAPIError("یوزرنیم و پسورد ربکا الزامی است")
+        # Try form token (OAuth2 style) then JSON
+        errors = []
         for path in ("/api/admin/token", "/api/admins/token", "/api/token"):
             try:
-                data = await self._request(
-                    "POST", path,
-                    data={"username": self.username, "password": self.password}
-                    if "token" in path else None,
-                    json={"username": self.username, "password": self.password},
+                r = await self._client.post(
+                    path,
+                    data={
+                        "username": self.username,
+                        "password": self.password,
+                        "grant_type": "password",
+                    },
+                    headers={"Accept": "application/json"},
                 )
-                token = data.get("access_token") or data.get("token")
-                if token:
-                    self._token = token
-                    return token
-            except RebeccaAPIError:
-                continue
-        # form style
-        try:
-            r = await self._client.post(
-                "/api/admin/token",
-                data={"username": self.username, "password": self.password, "grant_type": "password"},
-                headers={"Accept": "application/json"},
-            )
-            if r.status_code < 400:
-                data = r.json()
-                token = data.get("access_token") or data.get("token")
-                if token:
-                    self._token = token
-                    return token
-        except Exception:
-            pass
-        raise RebeccaAPIError("Login failed – check credentials")
+                if r.status_code < 400:
+                    data = r.json()
+                    token = data.get("access_token") or data.get("token")
+                    if token:
+                        self._token = token
+                        return token
+                errors.append(f"{path} form→{r.status_code}")
+            except Exception as e:
+                errors.append(f"{path} form→{e}")
+            try:
+                r = await self._client.post(
+                    path,
+                    json={"username": self.username, "password": self.password},
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                )
+                if r.status_code < 400:
+                    data = r.json()
+                    token = data.get("access_token") or data.get("token")
+                    if token:
+                        self._token = token
+                        return token
+                errors.append(f"{path} json→{r.status_code}")
+            except Exception as e:
+                errors.append(f"{path} json→{e}")
+        raise RebeccaAPIError(
+            "لاگین ربکا ناموفق – یوزر/پسورد اشتباه یا آدرس پنل غلط است. "
+            + " | ".join(errors[:4])
+        )
 
     async def test_connection(self) -> dict:
+        """Strict: login required + authenticated endpoint must succeed."""
         try:
-            if not self._token and self.username and self.password:
-                await self.login()
-            for path in ("/system", "/admin", "/admins?limit=1", "/services"):
+            if not self._token:
+                if self.username and self.password:
+                    await self.login()
+                else:
+                    return {"ok": False, "error": "یوزرنیم/پسورد یا توکن الزامی است"}
+
+            last_err = None
+            for path in ("/admin", "/system", "/admins?limit=1", "/services"):
                 try:
-                    stats = await self._request("GET", path)
-                    return {"ok": True, "stats": stats}
-                except RebeccaAPIError:
+                    data = await self._request("GET", path)
+                    return {
+                        "ok": True,
+                        "path": path,
+                        "stats": data if isinstance(data, dict) else {},
+                        "authenticated": True,
+                    }
+                except RebeccaAPIError as e:
+                    last_err = e
+                    if e.status_code in (401, 403):
+                        return {
+                            "ok": False,
+                            "error": "احراز هویت رد شد (401/403) – مشخصات ورود اشتباه است",
+                            "detail": e.detail,
+                        }
                     continue
-            return {"ok": True, "stats": {}}
+            return {
+                "ok": False,
+                "error": f"هیچ endpoint معتبری پاسخ نداد: {getattr(last_err, 'message', last_err)}",
+                "detail": getattr(last_err, "detail", None),
+            }
         except RebeccaAPIError as e:
-            return {"ok": False, "error": str(e), "detail": e.detail}
+            return {"ok": False, "error": e.message, "detail": e.detail}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     async def list_services(self) -> list[dict]:
-        """Return list of panel services: [{id, name, ...}, ...]"""
-        for path in ("/services", "/service", "/api/services"):
+        if not self._token:
+            await self.login()
+        for path in ("/services", "/service"):
             try:
-                data = await self._request("GET", path if path.startswith("/api") else path)
+                data = await self._request("GET", path)
                 if isinstance(data, list):
                     return data
                 if isinstance(data, dict):
@@ -146,7 +189,10 @@ class RebeccaPanel:
         note: str | None = None,
         service_ids: list[int] | None = None,
         permissions: dict | None = None,
+        **_kwargs,
     ) -> dict:
+        if not self._token:
+            await self.login()
         payload: dict[str, Any] = {
             "username": username,
             "password": password,
@@ -165,29 +211,28 @@ class RebeccaPanel:
             return await self._request("POST", "/admin", json=payload)
         except RebeccaAPIError as e:
             if e.status_code in (400, 422):
-                # retry minimal
-                minimal = {
-                    "username": username,
-                    "password": password,
-                    "is_sudo": False,
-                }
+                minimal = {"username": username, "password": password, "is_sudo": False}
                 if service_ids:
                     minimal["services"] = service_ids
                 return await self._request("POST", "/admin", json=minimal)
             raise
 
     async def modify_admin(self, username: str, **kwargs) -> dict:
+        if not self._token:
+            await self.login()
         return await self._request("PUT", f"/admin/{username}", json=kwargs)
 
     async def delete_admin(self, username: str) -> None:
+        if not self._token:
+            await self.login()
         await self._request("DELETE", f"/admin/{username}")
 
     async def disable_admin(self, username: str) -> None:
-        dead_pass = secrets.token_urlsafe(24)
+        dead = secrets.token_urlsafe(24)
         for kwargs in (
-            {"password": dead_pass, "is_sudo": False, "status": "disabled"},
-            {"password": dead_pass, "status": "disabled"},
-            {"password": dead_pass},
+            {"password": dead, "is_sudo": False, "status": "disabled"},
+            {"password": dead, "status": "disabled"},
+            {"password": dead},
         ):
             try:
                 await self.modify_admin(username, **kwargs)
@@ -208,6 +253,8 @@ class RebeccaPanel:
                 continue
 
     async def get_users_of_admin(self, admin_username: str) -> list[dict]:
+        if not self._token:
+            await self.login()
         try:
             data = await self._request("GET", f"/users?admin={admin_username}&limit=1000")
             if isinstance(data, dict):
