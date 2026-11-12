@@ -10,13 +10,13 @@
 ## نصب یک‌خطی (سرور لینوکس)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/mrmarzx/ROBIXA-BOT/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/mrmarzx/ROBIXA-BOT/2.0/install.sh)
 ```
 
 یا:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/mrmarzx/ROBIXA-BOT/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/mrmarzx/ROBIXA-BOT/2.0/install.sh | bash
 ```
 
 کلون دستی:
