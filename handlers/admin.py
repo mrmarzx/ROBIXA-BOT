@@ -4,6 +4,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, func
+from sqlalchemy.orm.attributes import flag_modified
 from datetime import datetime, timezone
 
 from config import settings
@@ -116,11 +117,19 @@ async def panel_url_received(message: Message, state: FSMContext):
         await message.answer("❌ آدرس باید با http:// یا https:// شروع شود.")
         return
     await state.update_data(base_url=url)
+    data = await state.get_data()
+    ptype = data.get("panel_type", "")
     await state.set_state(AddPanelStates.waiting_username)
-    await message.answer(
-        "نام کاربری ادمین پنل:\n(اگر فقط توکن دارید <code>-</code> بفرستید)",
-        reply_markup=cancel_keyboard(),
-    )
+    if ptype == "PASARGUARD":
+        hint = (
+            "نام کاربری ادمین پاسارگارد:\n"
+            "(اگر فقط <b>API Key</b> دارید <code>-</code> بفرستید و در مرحله بعد API Key را وارد کنید)"
+        )
+    elif ptype == "MARZBAN":
+        hint = "نام کاربری ادمین <b>sudo</b> مرزبان:\n(الزامی – بدون آن اتصال واقعی برقرار نمی‌شود)"
+    else:
+        hint = "نام کاربری ادمین <b>sudo</b> ربکا:\n(الزامی برای لاگین واقعی)"
+    await message.answer(hint, reply_markup=cancel_keyboard())
 
 
 @router.message(AddPanelStates.waiting_username)
@@ -138,14 +147,26 @@ async def panel_username_received(message: Message, state: FSMContext):
 async def panel_password_received(message: Message, state: FSMContext):
     p = message.text.strip()
     await state.update_data(password=None if p == "-" else p)
+    data = await state.get_data()
+    ptype = data.get("panel_type", "")
     await state.set_state(AddPanelStates.waiting_token)
-    await message.answer(
-        "توکن / API Key پنل:\n"
-        "• برای <b>REBECCA / MARZBAN</b>: JWT یا خالی با <code>-</code>\n"
-        "• برای <b>PASARGUARD</b>: حتماً <code>X-Api-Key</code> را وارد کنید\n"
-        "اگر ندارید <code>-</code> بفرستید.",
-        reply_markup=cancel_keyboard(),
-    )
+    if ptype == "PASARGUARD":
+        hint = (
+            "🔑 <b>API Key</b> پاسارگارد را وارد کنید (X-Api-Key):\n"
+            "از تنظیمات پنل → API Keys کپی کنید.\n"
+            "اگر با یوزر/پسورد لاگین می‌کنید و Key ندارید <code>-</code> بفرستید."
+        )
+    elif ptype == "MARZBAN":
+        hint = (
+            "توکن JWT مرزبان (اختیاری):\n"
+            "اگر یوزر/پسورد دادید معمولاً لازم نیست — <code>-</code> بفرستید."
+        )
+    else:
+        hint = (
+            "توکن JWT ربکا (اختیاری):\n"
+            "اگر یوزر/پسورد sudo دادید <code>-</code> بفرستید."
+        )
+    await message.answer(hint, reply_markup=cancel_keyboard())
 
 
 @router.message(AddPanelStates.waiting_token)
@@ -167,7 +188,11 @@ async def panel_token_received(message: Message, state: FSMContext):
         )
         if not result.get("ok"):
             await state.clear()
-            await message.answer(t.PANEL_CONNECTION_FAILED.format(error=result.get("error") or result.get("detail")))
+            err = result.get("error") or ""
+            det = result.get("detail")
+            if det:
+                err = f"{err}\n<code>{det}</code>"
+            await message.answer(t.PANEL_CONNECTION_FAILED.format(error=err or "unknown"))
             return
     except Exception as e:
         await state.clear()
@@ -385,12 +410,12 @@ async def panel_list_cb(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("panel:view:"))
-async def panel_view_cb(callback: CallbackQuery):
-    pid = int(callback.data.split(":")[2])
+
+async def _render_panel_view(callback: CallbackQuery, pid: int):
+    """Render panel detail without mutating frozen CallbackQuery.data."""
     panel = await get_panel(pid)
     if not panel:
-        await callback.answer("پنل یافت نشد", show_alert=True)
+        await callback.message.edit_text("پنل یافت نشد.", reply_markup=panels_menu())
         return
     extra = panel.extra_config or {}
     svc = extra.get("service_name") or extra.get("group_name") or extra.get("template_name") or "تنظیم نشده"
@@ -413,7 +438,14 @@ async def panel_view_cb(callback: CallbackQuery):
     ))
     b.row(InlineKeyboardButton(text="🔙 لیست پنل‌ها", callback_data="panel:list"))
     await callback.message.edit_text(text, reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("panel:view:"))
+async def panel_view_cb(callback: CallbackQuery):
+    pid = int(callback.data.split(":")[2])
+    await _render_panel_view(callback, pid)
     await callback.answer()
+
 
 
 @router.callback_query(F.data.startswith("panel:test:"))
@@ -451,9 +483,7 @@ async def panel_toggle_test(callback: CallbackQuery):
         await session.commit()
         en = panel.test_enabled
     await callback.answer("تست " + ("فعال شد" if en else "خاموش شد"))
-    # refresh view
-    callback.data = f"panel:view:{pid}"
-    await panel_view_cb(callback)
+    await _render_panel_view(callback, pid)
 
 
 @router.callback_query(F.data.startswith("panel:chsvc:"))
@@ -533,10 +563,10 @@ async def panel_set_service_cb(callback: CallbackQuery):
         else:
             extra = {"service_id": sid, "service_name": sname}
         panel.extra_config = extra
+        flag_modified(panel, "extra_config")
         await session.commit()
     await callback.answer("✅ ذخیره شد")
-    callback.data = f"panel:view:{pid}"
-    await panel_view_cb(callback)
+    await _render_panel_view(callback, pid)
 
 
 
