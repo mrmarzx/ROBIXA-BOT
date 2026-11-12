@@ -11,7 +11,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import settings
 from database.db import init_db
 from handlers import common, user, admin
-from utils.expire import expire_loop
+from utils.expire import expire_loop, set_bot
 from utils.backup import backup_loop
 
 LOG_DIR = Path("data")
@@ -50,6 +50,7 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
 
+    set_bot(bot)
     asyncio.create_task(expire_loop(interval_seconds=300))
     asyncio.create_task(
         backup_loop(bot, interval_hours=getattr(settings, "BACKUP_INTERVAL_HOURS", 24) or 24)
