@@ -3,7 +3,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy import select
+from sqlalchemy import select, func
 from datetime import datetime, timezone
 
 from config import settings
@@ -17,7 +17,7 @@ from keyboards.menus import (
     admin_menu, banking_menu, card_settings_menu, user_manage_keyboard,
 )
 from texts import fa as t
-from panels.factory import test_panel_connection
+from panels.factory import test_panel_connection, list_panel_services, PanelError
 
 router = Router()
 
@@ -29,6 +29,7 @@ class AddPanelStates(StatesGroup):
     waiting_username = State()
     waiting_password = State()
     waiting_token = State()
+    waiting_service = State()  # select service/group/template
 
 
 class AddProductStates(StatesGroup):
@@ -153,7 +154,7 @@ async def panel_token_received(message: Message, state: FSMContext):
     if token == "-":
         token = None
     data = await state.get_data()
-    await state.clear()
+    await state.update_data(api_token=token)
 
     await message.answer("⏳ در حال تست اتصال به پنل...")
     try:
@@ -165,12 +166,137 @@ async def panel_token_received(message: Message, state: FSMContext):
             token=token,
         )
         if not result.get("ok"):
+            await state.clear()
             await message.answer(t.PANEL_CONNECTION_FAILED.format(error=result.get("error") or result.get("detail")))
             return
     except Exception as e:
+        await state.clear()
         await message.answer(t.PANEL_CONNECTION_FAILED.format(error=str(e)))
         return
 
+    # Fetch services / groups / templates
+    ptype = data["panel_type"]
+    label = {
+        "REBECCA": "سرویس",
+        "PASARGUARD": "گروه (Group)",
+        "MARZBAN": "تمپلیت / اشتراک",
+    }.get(ptype, "سرویس")
+
+    try:
+        services = await list_panel_services(
+            panel_type=ptype,
+            base_url=data["base_url"],
+            panel_username=data.get("username"),
+            panel_password=data.get("password"),
+            token=token,
+        )
+    except Exception as e:
+        services = []
+        await message.answer(f"⚠️ اتصال برقرار شد ولی لیست {label} خوانده نشد:\n<code>{e}</code>")
+
+    if not services:
+        if ptype == "MARZBAN":
+            await state.set_state(AddPanelStates.waiting_service)
+            await message.answer(
+                "🔵 مرزبان تمپلیت/اشتراکی به‌صورت خودکار پیدا نشد.\n"
+                "نام <b>User Template</b> را که در پنل ساختید وارد کنید:\n"
+                "(باید از قبل در مرزبان ساخته شده و اینباندهای لازم به آن داده شده باشد)\n"
+                "یا برای رد کردن این مرحله <code>-</code> بفرستید.",
+                reply_markup=cancel_keyboard(),
+            )
+            return
+        # save without service
+        await _save_panel(message, state, data, token, extra_config={})
+        return
+
+    # show glass buttons
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    b = InlineKeyboardBuilder()
+    for s in services[:40]:
+        sid = s.get("id")
+        sname = s.get("name") or str(sid)
+        b.row(InlineKeyboardButton(
+            text=f"🔹 {sname}",
+            callback_data=f"panel_svc:{sid}:{sname[:40]}",
+        ))
+    b.row(InlineKeyboardButton(text="⏭ بدون انتخاب", callback_data="panel_svc:none"))
+    b.row(InlineKeyboardButton(text="❌ انصراف", callback_data="cancel"))
+    await state.set_state(AddPanelStates.waiting_service)
+    await state.update_data(_services_cache=[{k: s[k] for k in ("id", "name") if k in s} for s in services])
+    await message.answer(
+        f"✅ اتصال برقرار شد.\n\n"
+        f"📦 <b>{label}</b> مورد استفاده نمایندگی‌ها را انتخاب کنید:\n"
+        f"(ادمین‌هایی که ساخته می‌شوند از این {label} استفاده می‌کنند)",
+        reply_markup=b.as_markup(),
+    )
+
+
+@router.callback_query(AddPanelStates.waiting_service, F.data.startswith("panel_svc:"))
+async def panel_service_selected(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":", 2)
+    data = await state.get_data()
+    token = data.get("api_token")
+    ptype = data.get("panel_type", "")
+    extra: dict = {}
+
+    if parts[1] == "none":
+        extra = {}
+    else:
+        try:
+            sid = int(parts[1]) if parts[1].lstrip("-").isdigit() else parts[1]
+        except Exception:
+            sid = parts[1]
+        sname = parts[2] if len(parts) > 2 else str(sid)
+        if ptype == "REBECCA":
+            extra = {"service_id": sid, "service_ids": [sid], "service_name": sname}
+        elif ptype == "PASARGUARD":
+            extra = {"group_id": sid, "group_ids": [sid], "group_name": sname}
+        elif ptype == "MARZBAN":
+            extra = {"template_id": sid, "template_name": sname}
+        else:
+            extra = {"service_id": sid, "service_name": sname}
+
+    await state.clear()
+    await callback.message.edit_text("⏳ در حال ذخیره پنل...")
+    await _save_panel_from_cb(callback, data, token, extra)
+    await callback.answer()
+
+
+@router.message(AddPanelStates.waiting_service)
+async def panel_service_text(message: Message, state: FSMContext):
+    """Marzban manual template name entry."""
+    name = message.text.strip()
+    data = await state.get_data()
+    token = data.get("api_token")
+    extra = {}
+    if name and name != "-":
+        # try validate against panel
+        try:
+            services = await list_panel_services(
+                panel_type=data["panel_type"],
+                base_url=data["base_url"],
+                panel_username=data.get("username"),
+                panel_password=data.get("password"),
+                token=token,
+            )
+            found = next((s for s in services if (s.get("name") or "").lower() == name.lower()), None)
+            if found:
+                extra = {"template_id": found["id"], "template_name": found["name"]}
+                await message.answer(f"✅ تمپلیت <b>{found['name']}</b> پیدا و تأیید شد.")
+            else:
+                extra = {"template_name": name}
+                await message.answer(
+                    f"⚠️ تمپلیت با نام <code>{name}</code> در لیست پیدا نشد؛ "
+                    f"با همین نام ذخیره شد. مطمئن شوید در مرزبان ساخته شده باشد."
+                )
+        except Exception:
+            extra = {"template_name": name}
+    await state.clear()
+    await _save_panel(message, state, data, token, extra)
+
+
+async def _save_panel(message: Message, state: FSMContext, data: dict, token, extra_config: dict):
     async with async_session() as session:
         panel = Panel(
             name=data["name"],
@@ -184,14 +310,56 @@ async def panel_token_received(message: Message, state: FSMContext):
             test_data_limit_gb=1,
             test_days=1,
             test_limit_days=42,
+            extra_config=extra_config or {},
         )
         session.add(panel)
         await session.commit()
         await session.refresh(panel)
-
+    svc_info = ""
+    if extra_config:
+        svc_info = (
+            f"\n📦 سرویس/گروه/تمپلیت: <b>"
+            f"{extra_config.get('service_name') or extra_config.get('group_name') or extra_config.get('template_name') or '-'}"
+            f"</b>"
+        )
     await message.answer(
-        t.PANEL_ADDED_SUCCESS + f"\n\n🆔 شناسه: <code>{panel.id}</code>\nنام: {panel.name}\nنوع: {panel.panel_type}",
+        t.PANEL_ADDED_SUCCESS
+        + f"\n\n🆔 شناسه: <code>{panel.id}</code>\nنام: {panel.name}\nنوع: {panel.panel_type}"
+        + svc_info,
         reply_markup=admin_menu(),
+    )
+
+
+async def _save_panel_from_cb(callback: CallbackQuery, data: dict, token, extra_config: dict):
+    async with async_session() as session:
+        panel = Panel(
+            name=data["name"],
+            panel_type=data["panel_type"],
+            base_url=data["base_url"],
+            username=data.get("username"),
+            password=data.get("password"),
+            api_token=token,
+            is_active=True,
+            test_enabled=True,
+            test_data_limit_gb=1,
+            test_days=1,
+            test_limit_days=42,
+            extra_config=extra_config or {},
+        )
+        session.add(panel)
+        await session.commit()
+        await session.refresh(panel)
+    svc_info = ""
+    if extra_config:
+        svc_info = (
+            f"\n📦 سرویس/گروه/تمپلیت: <b>"
+            f"{extra_config.get('service_name') or extra_config.get('group_name') or extra_config.get('template_name') or '-'}"
+            f"</b>"
+        )
+    await callback.message.edit_text(
+        t.PANEL_ADDED_SUCCESS
+        + f"\n\n🆔 شناسه: <code>{panel.id}</code>\nنام: {panel.name}\nنوع: {panel.panel_type}"
+        + svc_info
     )
 
 
@@ -202,17 +370,174 @@ async def panel_list_cb(callback: CallbackQuery):
         await callback.message.edit_text("هیچ پنلی ثبت نشده.", reply_markup=panels_menu())
         await callback.answer()
         return
-    lines = ["📋 <b>لیست پنل‌ها:</b>\n"]
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    b = InlineKeyboardBuilder()
+    lines = ["📋 <b>لیست پنل‌ها</b>\nروی هر پنل بزنید تا تنظیمات/سرویس را ببینید:\n"]
     for p in panels:
         status = "🟢" if p.is_active else "🔴"
-        test = "✅ تست فعال" if p.test_enabled else "⏸ تست خاموش"
-        lines.append(
-            f"{status} <b>{p.name}</b> (ID:{p.id})\n"
-            f"   نوع: {p.panel_type} | {test}\n"
-            f"   <code>{p.base_url}</code>\n"
-        )
-    await callback.message.edit_text("\n".join(lines), reply_markup=panels_menu())
+        extra = p.extra_config or {}
+        svc = extra.get("service_name") or extra.get("group_name") or extra.get("template_name") or "—"
+        lines.append(f"{status} <b>{p.name}</b> · {p.panel_type}\n   سرویس: {svc}")
+        b.row(InlineKeyboardButton(text=f"{status} {p.name}", callback_data=f"panel:view:{p.id}"))
+    b.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="panel:menu"))
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("panel:view:"))
+async def panel_view_cb(callback: CallbackQuery):
+    pid = int(callback.data.split(":")[2])
+    panel = await get_panel(pid)
+    if not panel:
+        await callback.answer("پنل یافت نشد", show_alert=True)
+        return
+    extra = panel.extra_config or {}
+    svc = extra.get("service_name") or extra.get("group_name") or extra.get("template_name") or "تنظیم نشده"
+    text = (
+        f"🖥 <b>{panel.name}</b>\n"
+        f"نوع: <b>{panel.panel_type}</b>\n"
+        f"آدرس: <code>{panel.base_url}</code>\n"
+        f"وضعیت: {'🟢 فعال' if panel.is_active else '🔴 غیرفعال'}\n"
+        f"تست: {'✅' if panel.test_enabled else '⏸'}\n"
+        f"📦 سرویس/گروه/تمپلیت: <b>{svc}</b>\n"
+    )
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📦 تغییر سرویس", callback_data=f"panel:chsvc:{pid}"))
+    b.row(InlineKeyboardButton(text="🔄 تست اتصال", callback_data=f"panel:test:{pid}"))
+    b.row(InlineKeyboardButton(
+        text="⏸ خاموش کردن تست" if panel.test_enabled else "✅ روشن کردن تست",
+        callback_data=f"panel:toggletest:{pid}",
+    ))
+    b.row(InlineKeyboardButton(text="🔙 لیست پنل‌ها", callback_data="panel:list"))
+    await callback.message.edit_text(text, reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("panel:test:"))
+async def panel_test_cb(callback: CallbackQuery):
+    pid = int(callback.data.split(":")[2])
+    panel = await get_panel(pid)
+    if not panel:
+        await callback.answer("یافت نشد", show_alert=True)
+        return
+    await callback.answer("در حال تست...")
+    result = await test_panel_connection(
+        panel_type=panel.panel_type,
+        base_url=panel.base_url,
+        username=panel.username,
+        password=panel.password,
+        token=panel.api_token,
+    )
+    if result.get("ok"):
+        await callback.message.answer(f"✅ اتصال به <b>{panel.name}</b> موفق بود.")
+    else:
+        await callback.message.answer(
+            f"❌ اتصال ناموفق:\n<code>{result.get('error') or result.get('detail')}</code>"
+        )
+
+
+@router.callback_query(F.data.startswith("panel:toggletest:"))
+async def panel_toggle_test(callback: CallbackQuery):
+    pid = int(callback.data.split(":")[2])
+    async with async_session() as session:
+        panel = await session.get(Panel, pid)
+        if not panel:
+            await callback.answer("یافت نشد", show_alert=True)
+            return
+        panel.test_enabled = not panel.test_enabled
+        await session.commit()
+        en = panel.test_enabled
+    await callback.answer("تست " + ("فعال شد" if en else "خاموش شد"))
+    # refresh view
+    callback.data = f"panel:view:{pid}"
+    await panel_view_cb(callback)
+
+
+@router.callback_query(F.data.startswith("panel:chsvc:"))
+async def panel_change_service(callback: CallbackQuery, state: FSMContext):
+    pid = int(callback.data.split(":")[2])
+    panel = await get_panel(pid)
+    if not panel:
+        await callback.answer("یافت نشد", show_alert=True)
+        return
+    label = {
+        "REBECCA": "سرویس",
+        "PASARGUARD": "گروه",
+        "MARZBAN": "تمپلیت",
+    }.get(panel.panel_type, "سرویس")
+    try:
+        services = await list_panel_services(
+            panel_type=panel.panel_type,
+            base_url=panel.base_url,
+            panel_username=panel.username,
+            panel_password=panel.password,
+            token=panel.api_token,
+        )
+    except Exception as e:
+        await callback.answer(f"خطا: {e}", show_alert=True)
+        return
+    if not services and panel.panel_type == "MARZBAN":
+        await state.set_state(AddPanelStates.waiting_service)
+        await state.update_data(edit_panel_id=pid, panel_type="MARZBAN")
+        await callback.message.edit_text(
+            "نام User Template مرزبان را وارد کنید:",
+            reply_markup=cancel_keyboard(),
+        )
+        await callback.answer()
+        return
+    if not services:
+        await callback.answer("سرویسی یافت نشد", show_alert=True)
+        return
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    b = InlineKeyboardBuilder()
+    for s in services[:40]:
+        sid = s.get("id")
+        sname = s.get("name") or str(sid)
+        b.row(InlineKeyboardButton(
+            text=f"🔹 {sname}",
+            callback_data=f"panel_setsvc:{pid}:{sid}:{sname[:40]}",
+        ))
+    b.row(InlineKeyboardButton(text="🔙", callback_data=f"panel:view:{pid}"))
+    await callback.message.edit_text(
+        f"📦 {label} جدید را برای پنل <b>{panel.name}</b> انتخاب کنید:",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("panel_setsvc:"))
+async def panel_set_service_cb(callback: CallbackQuery):
+    parts = callback.data.split(":", 3)
+    pid = int(parts[1])
+    try:
+        sid = int(parts[2]) if parts[2].lstrip("-").isdigit() else parts[2]
+    except Exception:
+        sid = parts[2]
+    sname = parts[3] if len(parts) > 3 else str(sid)
+    async with async_session() as session:
+        panel = await session.get(Panel, pid)
+        if not panel:
+            await callback.answer("یافت نشد", show_alert=True)
+            return
+        ptype = panel.panel_type
+        if ptype == "REBECCA":
+            extra = {"service_id": sid, "service_ids": [sid], "service_name": sname}
+        elif ptype == "PASARGUARD":
+            extra = {"group_id": sid, "group_ids": [sid], "group_name": sname}
+        elif ptype == "MARZBAN":
+            extra = {"template_id": sid, "template_name": sname}
+        else:
+            extra = {"service_id": sid, "service_name": sname}
+        panel.extra_config = extra
+        await session.commit()
+    await callback.answer("✅ ذخیره شد")
+    callback.data = f"panel:view:{pid}"
+    await panel_view_cb(callback)
+
 
 
 # ==================== Products ====================
@@ -740,14 +1065,74 @@ async def u_services(callback: CallbackQuery):
 
 
 # ==================== Placeholders ====================
+class BroadcastStates(StatesGroup):
+    waiting_text = State()
+
+
 @router.message(F.text == t.BTN_BROADCAST)
-async def broadcast_ph(message: Message):
-    await message.answer("📢 پیام همگانی در آپدیت بعدی کامل می‌شود.")
+async def broadcast_start(message: Message, state: FSMContext):
+    user = await get_or_create_user(message.from_user.id)
+    if not is_admin(message.from_user.id, user.is_admin):
+        await message.answer(t.NOT_ADMIN)
+        return
+    await state.set_state(BroadcastStates.waiting_text)
+    await message.answer(
+        "📢 متن پیام همگانی را ارسال کنید:\n(برای لغو /cancel)",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(BroadcastStates.waiting_text)
+async def broadcast_send(message: Message, state: FSMContext):
+    if message.text and message.text.strip() in ("/cancel", "❌ انصراف"):
+        await state.clear()
+        await message.answer(t.CANCELLED)
+        return
+    await state.clear()
+    text = message.html_text or message.text or ""
+    if not text:
+        await message.answer("متن خالی است.")
+        return
+    await message.answer("⏳ در حال ارسال...")
+    sent = 0
+    fail = 0
+    async with async_session() as session:
+        result = await session.execute(select(BotUser).where(BotUser.status == "active"))
+        users = list(result.scalars().all())
+    for u in users:
+        try:
+            await message.bot.send_message(u.telegram_id, f"📢 پیام همگانی:\n\n{text}")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    await message.answer(f"✅ ارسال شد: {sent}\n❌ ناموفق: {fail}")
 
 
 @router.message(F.text == t.BTN_TEXTS)
 async def texts_ph(message: Message):
     await message.answer("📝 تغییر متون در آپدیت بعدی.")
+
+
+
+@router.message(F.text == t.BTN_STATS)
+async def stats_handler(message: Message):
+    user = await get_or_create_user(message.from_user.id)
+    if not is_admin(message.from_user.id, user.is_admin):
+        await message.answer(t.NOT_ADMIN)
+        return
+    async with async_session() as session:
+        users_c = (await session.execute(select(func.count()).select_from(BotUser))).scalar() or 0
+        svc_c = (await session.execute(select(func.count()).select_from(Service))).scalar() or 0
+        active_c = (await session.execute(select(func.count()).select_from(Service).where(Service.is_active == True))).scalar() or 0
+        orders_c = (await session.execute(select(func.count()).select_from(Order).where(Order.status == OrderStatus.COMPLETED.value))).scalar() or 0
+    await message.answer(
+        f"📊 <b>آمار ربات</b>\n\n"
+        f"👥 کاربران: <b>{users_c}</b>\n"
+        f"📦 کل نمایندگی‌ها: <b>{svc_c}</b>\n"
+        f"✅ فعال: <b>{active_c}</b>\n"
+        f"💳 سفارش‌های تکمیل‌شده: <b>{orders_c}</b>"
+    )
 
 
 @router.message(F.text == t.BTN_BACKUP)
