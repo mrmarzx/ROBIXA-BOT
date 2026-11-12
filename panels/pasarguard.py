@@ -1,14 +1,9 @@
-"""
-PasarGuard Panel API Client
-Auth: X-Api-Key header (preferred) or Bearer token from admin login
-Docs: https://docs.pasarguard.org/
-API paths commonly under /api/admin/...
-"""
+"""PasarGuard panel client – reseller admin + groups."""
 from __future__ import annotations
-import httpx
-from typing import Any
-from datetime import datetime, timedelta, timezone
 import logging
+import secrets
+from typing import Any
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -25,16 +20,16 @@ class PasarGuardPanel:
     def __init__(
         self,
         base_url: str,
-        api_key: str | None = None,
         username: str | None = None,
         password: str | None = None,
+        token: str | None = None,
         timeout: float = 30.0,
     ):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
         self.username = username
         self.password = password
-        self._token: str | None = None
+        self._token = token  # may be X-Api-Key or Bearer
+        self._api_key = token
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
 
@@ -42,10 +37,10 @@ class PasarGuardPanel:
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self.timeout,
-            verify=True,
+            verify=False,
             follow_redirects=True,
         )
-        if not self.api_key and self.username and self.password:
+        if not self._token and self.username and self.password:
             await self.login()
         return self
 
@@ -53,13 +48,11 @@ class PasarGuardPanel:
         if self._client:
             await self._client.aclose()
 
-    @property
-    def headers(self) -> dict:
+    def _headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self.api_key:
-            h["X-Api-Key"] = self.api_key
-            # also support Authorization: apikey form
-            h["Authorization"] = f"apikey {self.api_key}"
+        if self._api_key:
+            h["X-Api-Key"] = self._api_key
+            h["Authorization"] = f"Bearer {self._api_key}"
         elif self._token:
             h["Authorization"] = f"Bearer {self._token}"
         return h
@@ -67,57 +60,57 @@ class PasarGuardPanel:
     async def _request(self, method: str, path: str, **kwargs) -> Any:
         if not self._client:
             raise PasarGuardAPIError("Client not initialized")
-        url = path if path.startswith("http") else path
-        if not url.startswith("/"):
-            url = "/" + url
+        path = path if path.startswith("/") else f"/{path}"
         try:
-            resp = await self._client.request(method, url, headers=self.headers, **kwargs)
+            r = await self._client.request(method, path, headers=self._headers(), **kwargs)
         except httpx.RequestError as e:
             raise PasarGuardAPIError(f"Connection error: {e}") from e
-
-        if resp.status_code >= 400:
+        if r.status_code >= 400:
             try:
-                detail = resp.json()
+                detail = r.json()
             except Exception:
-                detail = resp.text
-            raise PasarGuardAPIError(
-                f"API error {resp.status_code}",
-                status_code=resp.status_code,
-                detail=detail,
-            )
-        if resp.status_code == 204:
-            return None
+                detail = r.text
+            raise PasarGuardAPIError(f"HTTP {r.status_code}", status_code=r.status_code, detail=detail)
+        if r.status_code == 204 or not r.content:
+            return {}
         try:
-            return resp.json()
+            return r.json()
         except Exception:
-            return resp.text
+            return {"raw": r.text}
 
     async def login(self) -> str:
-        """Fallback admin token login (Marzban-compatible)."""
-        if not self._client:
-            raise PasarGuardAPIError("Client not initialized")
-        resp = await self._client.post(
-            "/api/admin/token",
-            data={"username": self.username, "password": self.password},
-            headers={"Accept": "application/json"},
-        )
-        if resp.status_code >= 400:
-            raise PasarGuardAPIError("Login failed", status_code=resp.status_code, detail=resp.text)
-        result = resp.json()
-        token = result.get("access_token") or result.get("token")
-        if not token:
-            raise PasarGuardAPIError("No token", detail=result)
-        self._token = token
-        return token
+        for path in ("/api/admin/token", "/api/admins/token", "/api/token"):
+            try:
+                r = await self._client.post(
+                    path,
+                    data={"username": self.username, "password": self.password, "grant_type": "password"},
+                    headers={"Accept": "application/json"},
+                )
+                if r.status_code < 400:
+                    data = r.json()
+                    token = data.get("access_token") or data.get("token")
+                    if token:
+                        self._token = token
+                        return token
+            except Exception:
+                continue
+            try:
+                data = await self._request(
+                    "POST", path,
+                    json={"username": self.username, "password": self.password},
+                )
+                token = data.get("access_token") or data.get("token")
+                if token:
+                    self._token = token
+                    return token
+            except PasarGuardAPIError:
+                continue
+        if self._api_key:
+            return self._api_key
+        raise PasarGuardAPIError("Login failed – provide API key or valid credentials")
 
     async def test_connection(self) -> dict:
-        for path in (
-            "/api/system",
-            "/api/admin/system",
-            "/api/admin/users?limit=1",
-            "/api/users?limit=1",
-            "/api/admin/groups",
-        ):
+        for path in ("/api/system", "/api/admin", "/api/admins?limit=1", "/api/groups"):
             try:
                 data = await self._request("GET", path)
                 return {"ok": True, "stats": data, "path": path}
@@ -125,108 +118,79 @@ class PasarGuardPanel:
                 continue
         return {"ok": False, "error": "Could not reach any known system endpoint"}
 
-    async def get_group_ids(self) -> list[int]:
-        """Fetch available group IDs (required by many PasarGuard installs)."""
-        for path in ("/api/admin/groups", "/api/groups", "/api/admin/groups/simple"):
+    async def list_groups(self) -> list[dict]:
+        """Return groups: [{id, name, inbound_tags, ...}]"""
+        for path in ("/api/groups", "/api/group/s", "/api/group"):
             try:
                 data = await self._request("GET", path)
-                groups = []
+                if isinstance(data, list):
+                    return data
                 if isinstance(data, dict):
-                    groups = data.get("groups") or data.get("items") or data.get("data") or []
-                elif isinstance(data, list):
-                    groups = data
-                ids = []
-                for g in groups:
-                    if isinstance(g, dict) and "id" in g:
-                        ids.append(int(g["id"]))
-                    elif isinstance(g, int):
-                        ids.append(g)
-                if ids:
-                    return ids
+                    for key in ("groups", "items", "data", "results"):
+                        if key in data and isinstance(data[key], list):
+                            return data[key]
             except PasarGuardAPIError:
                 continue
         return []
 
-    async def create_user(
+    async def list_services(self) -> list[dict]:
+        """Alias – PasarGuard uses groups as service equivalent."""
+        return await self.list_groups()
+
+    async def create_admin(
         self,
         username: str,
-        data_limit_gb: int = 0,
-        days: int = 30,
+        password: str,
+        is_sudo: bool = False,
+        telegram_id: int | None = None,
         note: str | None = None,
-        status: str = "active",
-        proxies: dict | None = None,
         group_ids: list[int] | None = None,
-        **kwargs,
+        status: str = "active",
     ) -> dict:
-        expire = 0
-        if days and days > 0:
-            expire = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp())
-        data_limit = 0
-        if data_limit_gb and data_limit_gb > 0:
-            data_limit = int(data_limit_gb * 1024 * 1024 * 1024)
-
-        if group_ids is None:
-            group_ids = await self.get_group_ids()
-
         payload: dict[str, Any] = {
             "username": username,
+            "password": password,
+            "is_sudo": False,
             "status": status,
-            "expire": expire,
-            "data_limit": data_limit,
-            "data_limit_reset_strategy": "no_reset",
-            "note": note or f"ROBIXA {datetime.now().isoformat()}",
         }
+        if telegram_id:
+            payload["telegram_id"] = telegram_id
+        if note:
+            payload["note"] = note
         if group_ids:
             payload["group_ids"] = group_ids
-        if proxies:
-            payload["proxies"] = proxies
-        if kwargs.get("inbounds"):
-            payload["inbounds"] = kwargs["inbounds"]
-
+            payload["groups"] = group_ids
         last_err = None
-        for path in ("/api/admin/users", "/api/user", "/api/users"):
+        for path in ("/api/admin", "/api/admins"):
             try:
                 return await self._request("POST", path, json=payload)
             except PasarGuardAPIError as e:
                 last_err = e
-                if e.status_code in (404, 405, 422):
-                    # 422 may mean missing required field; try next shape
+                if e.status_code in (404, 405):
                     continue
+                if e.status_code in (400, 422) and group_ids:
+                    # retry without groups
+                    payload.pop("group_ids", None)
+                    payload.pop("groups", None)
+                    try:
+                        return await self._request("POST", path, json=payload)
+                    except PasarGuardAPIError:
+                        pass
                 raise
-        raise last_err or PasarGuardAPIError("No create-user endpoint worked")
+        raise last_err or PasarGuardAPIError("create_admin failed")
 
-    async def get_user(self, username: str) -> dict:
-        for path in (
-            f"/api/admin/users/{username}",
-            f"/api/user/{username}",
-            f"/api/users/{username}",
-        ):
-            try:
-                return await self._request("GET", path)
-            except PasarGuardAPIError as e:
-                if e.status_code == 404:
-                    continue
-                raise
-        raise PasarGuardAPIError(f"User {username} not found")
-
-    async def modify_user(self, username: str, **kwargs) -> dict:
-        for path in (f"/api/admin/users/{username}", f"/api/user/{username}"):
+    async def modify_admin(self, username: str, **kwargs) -> dict:
+        for path in (f"/api/admin/{username}", f"/api/admins/{username}"):
             try:
                 return await self._request("PUT", path, json=kwargs)
             except PasarGuardAPIError as e:
                 if e.status_code in (404, 405):
                     continue
                 raise
-        raise PasarGuardAPIError("modify_user failed")
+        raise PasarGuardAPIError("modify_admin failed")
 
-    async def disable_user(self, username: str) -> dict:
-        return await self.modify_user(username, status="disabled")
-
-    async def enable_user(self, username: str) -> dict:
-        return await self.modify_user(username, status="active")
-
-    async def delete_user(self, username: str) -> None:
-        for path in (f"/api/admin/users/{username}", f"/api/user/{username}"):
+    async def delete_admin(self, username: str) -> None:
+        for path in (f"/api/admin/{username}", f"/api/admins/{username}"):
             try:
                 await self._request("DELETE", path)
                 return
@@ -234,3 +198,93 @@ class PasarGuardPanel:
                 if e.status_code in (404, 405):
                     continue
                 raise
+
+    async def disable_admin(self, username: str) -> None:
+        try:
+            await self.modify_admin(username, status="disabled")
+            return
+        except PasarGuardAPIError:
+            pass
+        dead_pass = secrets.token_urlsafe(24)
+        try:
+            await self.modify_admin(username, password=dead_pass, status="disabled")
+        except PasarGuardAPIError:
+            try:
+                await self.modify_admin(username, password=dead_pass)
+            except PasarGuardAPIError:
+                pass
+
+    async def enable_admin(self, username: str, password: str) -> None:
+        try:
+            await self.modify_admin(username, password=password, status="active")
+            return
+        except PasarGuardAPIError:
+            pass
+        try:
+            await self.modify_admin(username, password=password)
+        except PasarGuardAPIError:
+            pass
+
+    async def get_users_of_admin(self, admin_username: str) -> list[dict]:
+        for path in (
+            f"/api/users?admin={admin_username}&limit=1000",
+            f"/api/admin/users?admin={admin_username}&limit=1000",
+            "/api/users?limit=1000",
+        ):
+            try:
+                data = await self._request("GET", path)
+                users = data.get("users") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                if "admin=" not in path:
+                    users = [
+                        u for u in (users or [])
+                        if (u.get("admin") or {}).get("username") == admin_username
+                        or u.get("admin") == admin_username
+                        or u.get("created_by") == admin_username
+                    ]
+                return users or []
+            except PasarGuardAPIError:
+                continue
+        return []
+
+    async def disable_user(self, username: str) -> dict:
+        for path in (f"/api/user/{username}", f"/api/users/{username}"):
+            try:
+                return await self._request("PUT", path, json={"status": "disabled"})
+            except PasarGuardAPIError as e:
+                if e.status_code in (404, 405):
+                    continue
+                raise
+        return {}
+
+    async def enable_user(self, username: str) -> dict:
+        for path in (f"/api/user/{username}", f"/api/users/{username}"):
+            try:
+                return await self._request("PUT", path, json={"status": "active"})
+            except PasarGuardAPIError as e:
+                if e.status_code in (404, 405):
+                    continue
+                raise
+        return {}
+
+    async def disable_users(self, usernames: list[str]) -> list[str]:
+        done = []
+        for u in usernames:
+            try:
+                await self.disable_user(u)
+                done.append(u)
+            except Exception as e:
+                logger.warning("disable user %s: %s", u, e)
+        return done
+
+    async def enable_users(self, usernames: list[str]) -> list[str]:
+        done = []
+        for u in usernames:
+            try:
+                await self.enable_user(u)
+                done.append(u)
+            except Exception as e:
+                logger.warning("enable user %s: %s", u, e)
+        return done
+
+    def dashboard_url(self) -> str:
+        return f"{self.base_url}/dashboard/"
