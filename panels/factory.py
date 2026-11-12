@@ -38,9 +38,29 @@ async def test_panel_connection(
     password: str | None = None,
     token: str | None = None,
 ) -> dict:
+    """Strict real connection test – never returns ok on fake/empty response."""
+    if not base_url or not str(base_url).startswith(("http://", "https://")):
+        return {"ok": False, "error": "آدرس پنل باید با http:// یا https:// شروع شود"}
+    ptype = (panel_type or "").upper()
+    if ptype not in ("REBECCA", "MARZBAN", "PASARGUARD"):
+        return {"ok": False, "error": f"نوع پنل ناشناخته: {panel_type}"}
+    # Credentials required
+    if ptype == "PASARGUARD":
+        if not token and not (username and password):
+            return {"ok": False, "error": "برای پاسارگارد API Key (توکن) یا یوزر/پسورد لازم است"}
+    else:
+        if not (username and password) and not token:
+            return {"ok": False, "error": "یوزرنیم و پسورد (یا توکن) الزامی است"}
     try:
         async with _client(panel_type, base_url, username, password, token) as api:
-            return await api.test_connection()
+            result = await api.test_connection()
+            if not isinstance(result, dict):
+                return {"ok": False, "error": "پاسخ نامعتبر از پنل"}
+            if result.get("ok") is True and not result.get("authenticated"):
+                # force require authenticated flag from strict clients
+                if not result.get("path"):
+                    return {"ok": False, "error": "اتصال تأیید نشد (authenticated نبود)"}
+            return result
     except (RebeccaAPIError, MarzbanAPIError, PasarGuardAPIError) as e:
         return {"ok": False, "error": e.message, "detail": getattr(e, "detail", None)}
     except Exception as e:
