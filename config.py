@@ -1,6 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
-import os
 
 
 class Settings(BaseSettings):
@@ -13,7 +12,7 @@ class Settings(BaseSettings):
     BOT_TOKEN: str = ""
     ADMIN_IDS: str = ""
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/robixa.db"
-    BOT_VERSION: str = "2.0.0"
+    BOT_VERSION: str = "2.1.512"
     BOT_NAME: str = "ROBIXA BOT"
     DEFAULT_LANGUAGE: str = "fa"
     SUPPORT_USERNAME: str = "@Support"
